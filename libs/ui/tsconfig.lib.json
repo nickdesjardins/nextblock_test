@@ -1,0 +1,31 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "../../dist/out-tsc",
+    "composite": true,
+    "types": [
+      "node",
+      "@nx/react/typings/cssmodule.d.ts",
+      "@nx/react/typings/image.d.ts"
+    ]
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "../../libs/environment.d.ts",
+    "../utils/src/**/*.ts",
+    "../utils/src/**/*.tsx"
+  ],
+  "exclude": [
+    "src/**/*.spec.ts",
+    "src/**/*.spec.tsx",
+    "src/**/*.stories.ts",
+    "src/**/*.stories.tsx",
+    "vite.config.mts"
+  ],
+  // Compile the imported sibling sources inline (see `include` above) instead of using a
+  // project reference. A composite reference would demand a tsc -b output under dist/out-tsc
+  // that the vite build never produces (→ TS6305); listing the sources satisfies composite's
+  // "all files must be listed" rule (→ avoids TS6307). Mirrors libs/editor's working setup.
+  "references": []
+}

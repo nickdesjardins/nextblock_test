@@ -1,0 +1,16 @@
+{
+    "nxConsole.generateAiAgentRules": true,
+    "chatgpt.openOnStartup": true,
+    "cSpell.words": [
+        "btrim",
+        "freemius",
+        "Freemius",
+        "nextblock",
+        "nosniff",
+        "plpgsql",
+        "SAMEORIGIN",
+        "supabase",
+        "Supabase",
+        "SUPABASE"
+    ]
+}

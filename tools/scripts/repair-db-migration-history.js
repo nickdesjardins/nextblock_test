@@ -1,0 +1,350 @@
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const dotenv = require('dotenv');
+const readline = require('readline');
+
+const colors = {
+  reset: '\x1b[0m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  red: '\x1b[31m',
+  blue: '\x1b[34m',
+  dim: '\x1b[2m',
+};
+
+const repoRoot = path.resolve(__dirname, '../..');
+const workdir = path.join(repoRoot, 'libs/db/src');
+const migrationsDir = path.join(workdir, 'supabase/migrations');
+const npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+const argv = process.argv.slice(2);
+const args = new Set(argv);
+const baselineRepairFirstVersion = '00000000000000';
+
+function log(message, color = colors.reset) {
+  console.log(`${color}${message}${colors.reset}`);
+}
+
+function getArgValue(name) {
+  const eq = argv.find((a) => a.startsWith(`--${name}=`));
+  if (eq) return eq.slice(`--${name}=`.length);
+  const idx = argv.indexOf(`--${name}`);
+  if (idx !== -1 && argv[idx + 1] && !argv[idx + 1].startsWith('--')) {
+    return argv[idx + 1];
+  }
+  return null;
+}
+
+function loadEnvFiles() {
+  for (const envPath of [
+    path.join(repoRoot, '.env.local'),
+    path.join(repoRoot, '.env'),
+  ]) {
+    if (fs.existsSync(envPath)) {
+      dotenv.config({ path: envPath, override: false, quiet: true });
+    }
+  }
+}
+
+function getDbPassword() {
+  if (process.env.SUPABASE_DB_PASSWORD) {
+    return process.env.SUPABASE_DB_PASSWORD;
+  }
+
+  if (process.env.POSTGRES_PASSWORD) {
+    return process.env.POSTGRES_PASSWORD.replace(/^"(.*)"$/, '$1');
+  }
+
+  for (const key of ['POSTGRES_URL', 'DATABASE_URL']) {
+    const value = process.env[key];
+    if (!value) {
+      continue;
+    }
+
+    try {
+      const url = new URL(value);
+      return decodeURIComponent(url.password);
+    } catch {
+      // Ignore malformed URLs; the missing env check will explain the issue.
+    }
+  }
+
+  return null;
+}
+
+function requireEnv() {
+  const missing = [];
+
+  if (!process.env.SUPABASE_PROJECT_ID) {
+    missing.push('SUPABASE_PROJECT_ID');
+  }
+  if (!process.env.SUPABASE_ACCESS_TOKEN) {
+    missing.push('SUPABASE_ACCESS_TOKEN');
+  }
+  if (!getDbPassword()) {
+    missing.push('SUPABASE_DB_PASSWORD, POSTGRES_PASSWORD, POSTGRES_URL, or DATABASE_URL');
+  }
+
+  if (missing.length > 0) {
+    log(`Missing required environment variables: ${missing.join(', ')}`, colors.red);
+    process.exit(1);
+  }
+}
+
+function run(command, commandArgs) {
+  const dbPassword = getDbPassword();
+  const printable = [command, ...commandArgs.map((arg) => {
+    if (arg === dbPassword) {
+      return '<db-password>';
+    }
+    return arg.includes(' ') ? `"${arg}"` : arg;
+  })].join(' ');
+
+  log(`Running: ${printable}`, colors.blue);
+  const result = spawnSync(command, commandArgs, {
+    cwd: repoRoot,
+    env: process.env,
+    shell: process.platform === 'win32',
+    stdio: 'inherit',
+  });
+
+  if (result.error) {
+    log(result.error.message, colors.red);
+    process.exit(1);
+  }
+
+  if (result.status !== 0) {
+    process.exit(result.status || 1);
+  }
+}
+
+function supabase(commandArgs) {
+  run(npxBin, ['supabase', ...commandArgs]);
+}
+
+// ---------------------------------------------------------------------------
+// Auto-detection of the applied high-water mark.
+//
+// Migrations apply as a contiguous prefix (000, 001, … N), so the only unknown
+// when the history table has been wiped is the single highest applied version N.
+// We discover it by parsing each migration's CREATE TABLE statements and asking
+// the live database (via the PostgREST schema) which of those tables exist. The
+// newest migration whose table exists is the high-water mark. This needs no
+// per-migration upkeep, and `--through=<version>` overrides it when a tail of
+// table-less (data-only) migrations is also applied.
+// ---------------------------------------------------------------------------
+
+function stripSqlComments(sql) {
+  return sql
+    .replace(/\/\*[\s\S]*?\*\//g, ' ') // block comments
+    .replace(/--[^\n]*/g, ' '); // line comments
+}
+
+function getLocalMigrations() {
+  return fs
+    .readdirSync(migrationsDir)
+    .filter((fileName) => /^\d{14}_.*\.sql$/.test(fileName))
+    .sort()
+    .map((fileName) => {
+      const version = fileName.split('_')[0];
+      const sql = stripSqlComments(fs.readFileSync(path.join(migrationsDir, fileName), 'utf8'));
+      const createdTables = [];
+      // Anchor to line start so CREATE TABLE inside seed string literals is ignored.
+      const re = /^\s*create\s+table\s+(?:if\s+not\s+exists\s+)?(?:public\.)?"?([a-z_][a-z0-9_]*)"?/gim;
+      let match;
+      while ((match = re.exec(sql)) !== null) {
+        createdTables.push(match[1]);
+      }
+      return { version, fileName, createdTables };
+    });
+}
+
+function getSupabaseRest() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+  const key =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SECRET_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_ANON_KEY;
+  if (!url || !key) return null;
+  return { url: url.replace(/\/+$/, ''), key };
+}
+
+async function fetchExposedTables(rest) {
+  // The PostgREST root returns an OpenAPI spec listing every exposed table in
+  // one request — cheaper than probing each table individually.
+  try {
+    const res = await fetch(`${rest.url}/rest/v1/`, {
+      headers: { apikey: rest.key, Authorization: `Bearer ${rest.key}` },
+    });
+    if (!res.ok) return null;
+    const spec = await res.json();
+    const names = new Set();
+    if (spec && spec.definitions) {
+      Object.keys(spec.definitions).forEach((name) => names.add(name));
+    }
+    if (spec && spec.paths) {
+      Object.keys(spec.paths).forEach((p) => {
+        const m = p.match(/^\/([A-Za-z0-9_]+)$/);
+        if (m) names.add(m[1]);
+      });
+    }
+    return names.size > 0 ? names : null;
+  } catch {
+    return null;
+  }
+}
+
+async function tableExists(rest, table) {
+  try {
+    const res = await fetch(`${rest.url}/rest/v1/${encodeURIComponent(table)}?select=*&limit=1`, {
+      headers: { apikey: rest.key, Authorization: `Bearer ${rest.key}` },
+    });
+    return res.status === 200;
+  } catch {
+    return false;
+  }
+}
+
+async function detectHighWater(migrations, rest) {
+  const exposed = await fetchExposedTables(rest);
+  for (let i = migrations.length - 1; i >= 0; i -= 1) {
+    const migration = migrations[i];
+    for (const table of migration.createdTables) {
+      // eslint-disable-next-line no-await-in-loop
+      const exists = exposed ? exposed.has(table) : await tableExists(rest, table);
+      if (exists) {
+        return { version: migration.version, table };
+      }
+    }
+  }
+  return null;
+}
+
+function promptYesNo(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(answer.trim()));
+    });
+  });
+}
+
+async function main() {
+  loadEnvFiles();
+  requireEnv();
+
+  const dbPassword = getDbPassword();
+  const isCheck = args.has('--check');
+  const confirmed =
+    args.has('--confirm') ||
+    process.env.CI === 'true' ||
+    process.env.CONFIRM_DB_MIGRATION_REPAIR === 'true';
+  const skipPrompt =
+    args.has('--yes') || process.env.CI === 'true' || !process.stdin.isTTY;
+
+  const migrations = getLocalMigrations();
+  if (migrations.length === 0) {
+    log('No migration files found.', colors.red);
+    process.exit(1);
+  }
+
+  const override = getArgValue('through');
+  let ceiling = override;
+  let detection = null;
+
+  if (!ceiling) {
+    const rest = getSupabaseRest();
+    if (!rest) {
+      log('Cannot auto-detect the applied level: missing Supabase URL or API key in the environment.', colors.red);
+      log('Set NEXT_PUBLIC_SUPABASE_URL + a Supabase key, or pass --through=<version> explicitly.', colors.yellow);
+      process.exit(1);
+    }
+    log('Auto-detecting the applied migration high-water mark from the remote schema...', colors.dim);
+    detection = await detectHighWater(migrations, rest);
+    if (!detection) {
+      log('No applied migrations detected — none of the migration tables exist remotely.', colors.yellow);
+      log('This looks like a brand-new database: use `npm run db:migrate:fresh` instead,', colors.yellow);
+      log('or pass --through=<version> if you know the schema is further along.', colors.yellow);
+      process.exit(1);
+    }
+    ceiling = detection.version;
+  }
+
+  const versionsToMark = migrations
+    .map((m) => m.version)
+    .filter((version) => version >= baselineRepairFirstVersion && version <= ceiling);
+  const pendingAfter = migrations.map((m) => m.version).filter((version) => version > ceiling);
+
+  if (versionsToMark.length === 0) {
+    log(`No migrations at or below ${ceiling} — nothing to repair.`, colors.yellow);
+    process.exit(1);
+  }
+
+  log('Supabase migration history repair (auto-detect)', colors.green);
+  log(`Target project: ${process.env.SUPABASE_PROJECT_ID}`, colors.dim);
+  if (detection) {
+    log(`Detected applied through ${detection.version} (remote table "${detection.table}" exists).`, colors.dim);
+  } else {
+    log(`Using --through override: ${ceiling}.`, colors.dim);
+  }
+  log(
+    `Will mark ${versionsToMark.length} migration(s) as applied (${versionsToMark[0]} … ${versionsToMark[versionsToMark.length - 1]}). This does not run migration SQL.`,
+    colors.dim,
+  );
+  log(
+    pendingAfter.length > 0
+      ? `Left for \`npm run db:migrate\` to apply: ${pendingAfter.join(', ')}`
+      : 'No newer migrations remain to apply afterward.',
+    colors.dim,
+  );
+
+  if (isCheck || !confirmed) {
+    if (!confirmed && !isCheck) {
+      log('Dry run only. Run `npm run db:migrate:repair-history` to apply (override with --through=<version>).', colors.yellow);
+    }
+    return;
+  }
+
+  if (!skipPrompt) {
+    const ok = await promptYesNo(
+      `${colors.yellow}Mark 000…${ceiling} as applied on project ${process.env.SUPABASE_PROJECT_ID}? [y/N] ${colors.reset}`,
+    );
+    if (!ok) {
+      log('Aborted. No changes made.', colors.yellow);
+      process.exit(1);
+    }
+  }
+
+  supabase([
+    'link',
+    '--project-ref',
+    process.env.SUPABASE_PROJECT_ID,
+    '--password',
+    dbPassword,
+    '--workdir',
+    workdir,
+    '--yes',
+  ]);
+
+  supabase([
+    'migration',
+    'repair',
+    ...versionsToMark,
+    '--status',
+    'applied',
+    '--password',
+    dbPassword,
+    '--workdir',
+    workdir,
+    '--yes',
+  ]);
+
+  log('Migration history repaired. Run `npm run db:migrate:check` next.', colors.green);
+}
+
+main().catch((error) => {
+  log(error instanceof Error ? error.stack || error.message : String(error), colors.red);
+  process.exit(1);
+});

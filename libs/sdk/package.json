@@ -1,0 +1,14 @@
+{
+  "name": "@nextblock-cms/sdk",
+  "version": "0.12.6",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "dependencies": {
+    "zod": "*",
+    "lucide-react": "*"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

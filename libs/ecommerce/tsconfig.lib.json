@@ -1,0 +1,44 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "../../dist/out-tsc",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": [
+      "node",
+      "@nx/react/typings/cssmodule.d.ts",
+      "@nx/react/typings/image.d.ts",
+      "vite/client"
+    ]
+  },
+  // This project inherits composite:true from tsconfig.base.json. During the Nx release
+  // build (`nx run ecommerce:build --with-deps`, see tools/scripts/release-lib.js) the
+  // sibling libs are compiled first, after which tsc enforces the composite "list all
+  // files" rule on every file in the dts program. ecommerce imports @nextblock-cms/ui,
+  // /utils and /db, whose path aliases resolve to those siblings' SOURCE, so the sources
+  // must be listed here or the declaration build logs TS6307. We list them via `include`
+  // (NOT project `references`, which log TS6305 the vite build can't satisfy). vite's
+  // entryRoot:'src' keeps the emitted .d.ts scoped to this lib, so sibling sources never
+  // ship in the published package. Mirrors libs/editor.
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "../ui/src/**/*.ts",
+    "../ui/src/**/*.tsx",
+    "../utils/src/**/*.ts",
+    "../utils/src/**/*.tsx",
+    "../db/src/**/*.ts",
+    "../db/src/**/*.tsx"
+  ],
+  "exclude": [
+    "jest.config.ts",
+    "test-setup.ts",
+    "**/*.spec.ts",
+    "**/*.test.ts",
+    "**/*.spec.tsx",
+    "**/*.test.tsx",
+    "**/*.spec.js",
+    "**/*.test.js"
+  ],
+  "references": []
+}

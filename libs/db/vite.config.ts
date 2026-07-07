@@ -1,0 +1,115 @@
+import { defineConfig } from 'vite';
+import dts from 'vite-plugin-dts';
+import * as path from 'path';
+import * as fs from 'fs';
+
+const packageJsonPath = path.resolve(__dirname, 'package.json');
+const { version } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+
+export default defineConfig({
+  root: __dirname,
+  plugins: [
+    dts({
+      entryRoot: 'src',
+      // Use tsconfig.lib.json (include: src/**, no project references), not tsconfig.json
+      // (empty include + a reference to lib.json) — otherwise vite-plugin-dts builds the
+      // referenced composite project and emits to ../../dist/out-tsc instead of outDir below,
+      // shipping a package with no index.d.ts. (Matches libs/ui, libs/utils, etc.)
+      tsconfigPath: './tsconfig.lib.json',
+      outDir: '../../dist/libs/db',
+      exclude: ['vite.config.ts'],
+      afterBuild: () => {
+        const packageJson = {
+          name: '@nextblock-cms/db',
+          version,
+          main: 'index.cjs.js',
+          module: 'index.es.js',
+          types: 'index.d.ts',
+          // Enables tree-shaking so a client importing the browser `createClient` from
+          // '@nextblock-cms/db' does NOT drag in the server module (next/headers + the
+          // typeof-window guard). db uses a runtime guard, not a 'use client'/'use server'
+          // directive, so without this the unused server module is kept and throws in the
+          // client bundle ("cannot be imported from a Client Component module").
+          sideEffects: false,
+          exports: {
+            '.': {
+              types: './index.d.ts',
+              require: './index.cjs.js',
+              default: './index.es.js',
+            },
+            './server': {
+              types: './server.d.ts',
+              require: './server.cjs.js',
+              default: './server.es.js',
+            },
+            // Published consumers import this at runtime: @nextblock-cms/cortex's ai-config
+            // pulls encrypt/decrypt/resolveSecretEncryptionKey from '@nextblock-cms/db/secrets'.
+            // Without this export a Cortex AI route throws "Can't resolve
+            // '@nextblock-cms/db/secrets'" in a generated project (it only resolves in-monorepo
+            // via the tsconfig path). Emitted as its own build entry below.
+            './secrets': {
+              types: './secrets.d.ts',
+              require: './secrets.cjs.js',
+              default: './secrets.es.js',
+            },
+            './package.json': './package.json',
+          },
+          files: [
+            'dist',
+            'supabase',
+            'supabase/**',
+            'lib',
+            '*.js',
+            '*.cjs.js',
+            '*.es.js',
+            '*.mjs',
+            '*.d.ts'
+          ],
+        };
+
+        fs.writeFileSync(
+          path.resolve(__dirname, '../../dist/libs/db', 'package.json'),
+          JSON.stringify(packageJson, null, 2)
+        );
+      },
+    }),
+  ],
+  build: {
+    lib: {
+      entry: {
+        index: path.resolve(__dirname, './src/index.ts'),
+        server: path.resolve(__dirname, './src/server.ts'),
+        // Dedicated entry so secrets.{es,cjs}.js + secrets.d.ts are emitted at the dist root
+        // and the './secrets' export above resolves for published consumers (see @nextblock-cms/cortex).
+        secrets: path.resolve(__dirname, './src/secrets.ts'),
+      },
+      formats: ['es', 'cjs'],
+      fileName: (format, entryName) => {
+        const extension = format === 'es' ? 'es' : 'cjs';
+        return `${entryName}.${extension}.js`;
+      },
+    },
+    rollupOptions: {
+      output: {
+        // Emit one file per source module (no merged shared chunks). db mixes a client
+        // browser-createClient with server modules that use next/headers + a server guard;
+        // bundling merged them so importing db dragged server-only code (next/headers) into
+        // the client graph. preserveModules keeps them separate and tree-shakeable, so a
+        // client import of `createClient` no longer pulls next/headers.
+        preserveModules: true,
+        preserveModulesRoot: 'src',
+      },
+      external: (id) => {
+        // Externalize every bare specifier (@supabase/*, next/*, @nextblock-cms/*, ...) so
+        // preserveModules keeps them as bare imports and the consumer resolves them.
+        if (id.startsWith('.')) {
+          return false;
+        }
+        if (path.isAbsolute(id)) {
+          return id.includes('node_modules');
+        }
+        return true;
+      },
+    },
+  },
+});
